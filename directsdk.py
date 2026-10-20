@@ -436,6 +436,35 @@ class Client:
             stream.close()
 
     def _run(self, request, kwargs, body, manifest, names, system, frames):
+        try:
+            try:
+                from . import account_pool
+            except ImportError:
+                import account_pool
+            source = self.env if self.env is not None else os.environ
+            pinned = source.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR') or source.get('CLAUDE_CONFIG_DIR')
+            accounts = account_pool.configured_accounts() if self.env is None and not pinned else []
+            options = account_pool.candidates(accounts, kwargs['model'], getattr(self, '_pool_label', None)) if accounts else [None]
+            for account in options:
+                emitted = False
+                try:
+                    for chunk in self._run_once(request, kwargs, body, manifest, names, system, frames, account):
+                        emitted = True
+                        yield chunk
+                    if account:
+                        self._pool_label = account['label']
+                    return
+                except account_pool.SubscriptionQuotaRejected:
+                    if emitted or request.cancelled.is_set():
+                        raise
+                    # The native HTTP request was definitively rejected with no output.
+                    # Try each configured account at most once; never replay accepted tools.
+            raise RuntimeError('All included Claude subscriptions exhausted; no paid fallback')
+        finally:
+            with self._lock:
+                self._requests.discard(request)
+
+    def _run_once(self, request, kwargs, body, manifest, names, system, frames, account=None):
         p = None
         reader = None
         try:
@@ -462,6 +491,9 @@ class Client:
                 config = env.pop('CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR', None)
                 if config:
                     env['CLAUDE_CONFIG_DIR'] = config
+                if account:
+                    env['CLAUDE_CONFIG_DIR'] = account['config_dir']
+                    env.pop('CLAUDE_CODE_OAUTH_TOKEN', None)
                 env.pop('CLAUDE_CODE_EXTRA_BODY', None)
                 env.update(ENABLE_TOOL_SEARCH='false', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', CLAUDE_CODE_MAX_RETRIES='0', DISABLE_AUTO_COMPACT='1', DISABLE_COMPACT='1')
                 # Hermes owns budgets; native's replayed reminder invalidates cached history.
@@ -561,6 +593,13 @@ class Client:
                         first = f'first upstream attempt: status {admission.status}, capture ' + ('complete' if admission.capture.complete else 'incomplete') + (f', relay failure {admission.failure}' if admission.failure else '') + f', native retries denied: {admission.denied}'
                         if admission.error_text():
                             first += ', upstream said: ' + admission.error_text()[:500]
+                        if account and admission.status == 429 and admission.capture.message is None and not emitted:
+                            try:
+                                from . import account_pool
+                            except ImportError:
+                                import account_pool
+                            if account_pool.exhausted(account_pool.usage(account, fresh=True), kwargs['model']):
+                                raise account_pool.SubscriptionQuotaRejected('Included allowance exhausted: ' + account['label'])
                         raise RuntimeError(f'Incomplete upstream response ({first})' + (': ' + native_error if native_error else ''))
                     assistants = [admission.capture.message]
                     stopped = True
@@ -599,24 +638,24 @@ class Client:
                                     'completion_tokens_details': {'reasoning_tokens': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)},
                                     'native_cost': {'total_cost_usd': final.get('total_cost_usd'), 'modelUsage': final.get('modelUsage')}}
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
+                if account:
+                    normalized_usage['native_account'] = account['label']
                 finish = 'tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop')
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier]}, finish, normalized_usage)
                 chunk._response = response
                 yield chunk
         finally:
-            request.cancel()
             if request.admission is not None:
                 request.admission.close()
             if p is not None:
+                kill_process_tree(p)
                 p.wait(timeout=5)
                 if reader is not None:
                     reader.join(timeout=5)
                 for pipe in (p.stdin, p.stdout):
                     if pipe and not pipe.closed:
                         pipe.close()
-            with self._lock:
-                self._requests.discard(request)
 
     @staticmethod
     def _chunk(model, delta, finish=None, usage=None):

@@ -55,6 +55,13 @@ class ClaudeOAuthDirectSDKProfile(ProviderProfile):
         rows = self.discover_models(**kwargs)
         return [row["id"] for row in rows] if rows else None
 
+    def fetch_account_usage(self, **kwargs):
+        try:
+            from .account_pool import configured_accounts, usage_snapshot
+        except ImportError:
+            from account_pool import configured_accounts, usage_snapshot
+        return usage_snapshot() if configured_accounts() else None
+
     def setup_status(self, **kwargs):
         try:
             from .directsdk_setup import setup_status

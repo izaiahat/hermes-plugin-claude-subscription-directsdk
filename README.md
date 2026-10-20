@@ -173,6 +173,32 @@ Installed-plugin discovery (`$HERMES_HOME/plugins/<name>/`) and every missing-`c
 
 The subscription-backed task, CLI delegation, streaming, resume, denial, steering and interruption receipts are separate private artifacts. No auth data or trajectories are committed to this repository. Remaining qualification includes broader history transformations, cross-model signed replay, native versions/platforms, and adversarial steering reliability. Subscription invoice/overage reconciliation is not available from native list-price accounting.
 
+## Multiple Claude subscriptions
+
+Opt in with nonsecret directory references in the active Hermes profile's `config.yaml`:
+
+```yaml
+claude_subscription_accounts:
+  - label: claude-max-1
+    config_dir: /home/ubuntu/.claude
+  - label: claude-max-2
+    config_dir: /home/ubuntu/.claude-max-2
+```
+
+Use separately authenticated official Claude Code directories; never put tokens in this list.
+The pool checks the official OAuth usage endpoint, skips exhausted/unavailable accounts, and
+requires extra usage to be explicitly OFF. A successful account stays preferred within a client.
+Reset eligibility comes from provider usage; metadata is cached for at most 30 seconds.
+A 429 retries the next account only when fresh usage confirms exhaustion and no response was
+emitted or accepted. Cancellation, network errors and partial responses never replay.
+No API fallback, token copying, or quota-state file is introduced. Claude Code owns token refresh;
+if usage cannot be read, that account is skipped rather than treated as available.
+
+`/usage` lists each account's windows, reset times and extra-usage status.
+Explicit `CLAUDE_CONFIG_DIR` / `CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR` pins opt out of pooling.
+Existing processes retain their imported plugin until a deliberate session reload.
+This pools Claude subscriptions only; the OpenAI credential pool is unchanged.
+
 ## Attribution
 
 Extracted from hermes-agent PR #105863 (`feat: add Claude Subscription DirectSDK (Experimental) provider`) by @teknium1 and @unsupportedpastels. The provider-agnostic parts of that PR (external-process provider profiles, provider-native replay carriers, setup-flow gating, picker plumbing) land in Hermes core via hermes-agent PR #117451; the provider itself lives here as a standalone plugin because Hermes does not bundle vendor-specific subscription transports in-tree. The `claude` presence checks were added during extraction.

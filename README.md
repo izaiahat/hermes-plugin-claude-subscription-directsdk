@@ -195,7 +195,8 @@ but request admission and handoffs are always fresh.
 A 429 retries the next account only when fresh usage confirms exhaustion and no response was
 emitted or accepted. Cancellation, network errors and partial responses never replay.
 No API fallback or credential copying is introduced. A usage 401 triggers one official CLI
-initialize handshake with no prompt, then rechecks usage; the CLI alone owns token refresh.
+initialize handshake with no prompt and a deny-all Messages relay, then rechecks usage;
+the CLI alone owns token refresh.
 If renewal fails, the account is skipped and its separate `claude auth login --claudeai` is required.
 
 `/usage` lists each account's windows, reset times and extra-usage status.

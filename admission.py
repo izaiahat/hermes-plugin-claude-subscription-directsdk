@@ -75,7 +75,8 @@ class Capture:
 
 
 class Admission:
-    def __init__(self, upstream, timeout):
+    def __init__(self, upstream, timeout, *, allow_messages=True):
+        self.allow_messages = allow_messages
         self.upstream = urlsplit(upstream)
         host = self.upstream.hostname
         try:
@@ -138,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         with gate.lock:
-            if gate.cancelled or gate.used:
+            if not gate.allow_messages or gate.cancelled or gate.used:
                 gate.denied += 1
                 body = b'{"type":"error","error":{"type":"invalid_request_error","message":"HERMES_MODEL_ADMISSION_CONSUMED"}}'
                 self.send_response(400)

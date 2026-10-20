@@ -20,9 +20,8 @@ def payload(used=0, extra=False):
     return {'five_hour': {'utilization': used}, 'seven_day': {'utilization': used}, 'extra_usage': {'is_enabled': extra}}
 
 def test_filelock_dependency_declared():
-    import yaml
-    manifest = yaml.safe_load((Path(__file__).parents[1]/'plugin.yaml').read_text())
-    assert 'filelock>=3.13,<4' in manifest['python_dependencies']
+    manifest = (Path(__file__).parents[1]/'plugin.yaml').read_text()
+    assert 'filelock>=3.13,<4' in manifest.split('python_dependencies:')[1].split('platforms:')[0]
 
 
 def test_selection_and_reset(monkeypatch):
@@ -156,6 +155,32 @@ def test_official_renewal_then_preflight(monkeypatch):
     assert seen == ['fixture-expired', 'fixture-renewed']
 
 
+def test_failed_renewal_cannot_forward_messages(monkeypatch, tmp_path):
+    import urllib.error
+    import directsdk_setup as setup
+    from admission import Admission
+    from test_directsdk_setup import _cli
+    account = ACCOUNTS[1]
+    (Path(account['config_dir'])/'.credentials.json').write_text(json.dumps({'claudeAiOauth': {'accessToken': 'fixture-expired'}}))
+    command, env = _cli(tmp_path, {'auth': {'loggedIn': True}, 'models': [], 'account': {}, 'hang_upstream': True})
+    monkeypatch.setenv('FAKE_STATE', env['FAKE_STATE'])
+    monkeypatch.setattr(setup, '_resolve', lambda *args: command)
+    gates = []
+    def gate(upstream, timeout, **kw):
+        assert kw.get('allow_messages') is False
+        result = Admission('http://127.0.0.1:9', timeout, **kw)
+        gates.append(result)
+        return result
+    monkeypatch.setattr(setup, 'Admission', gate)
+    def reject(token):
+        raise urllib.error.HTTPError('https://fixture.invalid', 401, 'fixture', {}, None)
+    monkeypatch.setattr(pool, '_usage_request', reject)
+    with pytest.raises(RuntimeError, match='re-authenticate'):
+        pool.usage(account, fresh=True)
+    assert len(gates) == 1
+    assert gates[0].denied == 1 and not gates[0].used
+
+
 def test_account_lock_serializes_and_cancels(monkeypatch):
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -221,7 +246,12 @@ def test_http_quota_rejection_retries_once(monkeypatch, tmp_path):
         result = client.create(model='sonnet', messages=[{'role':'user','content':'fixture'}])
         assert result.choices[0].message.content == 'SUCCESS'
         assert result.usage.native_account == 'two'
+        assert client._pool_label == 'two'
         assert len(calls) == 2
+        state['one'] = payload()
+        resumed = client.create(model='sonnet', messages=[{'role':'user','content':'fixture next'}])
+        assert resumed.usage.native_account == 'two'
+        assert len(calls) == 3
         assert not client._requests
     finally:
         client.close()

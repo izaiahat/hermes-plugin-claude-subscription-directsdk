@@ -468,6 +468,8 @@ class Client:
                                 continue
                         for chunk in self._run_once(request, kwargs, body, manifest, names, system, frames, account):
                             emitted = True
+                            if account and hasattr(chunk, '_response'):
+                                self._pool_label = account['label']
                             yield chunk
                         if account:
                             self._pool_label = account['label']

@@ -19,6 +19,12 @@ def pool_accounts(tmp_path, monkeypatch):
 def payload(used=0, extra=False):
     return {'five_hour': {'utilization': used}, 'seven_day': {'utilization': used}, 'extra_usage': {'is_enabled': extra}}
 
+def test_filelock_dependency_declared():
+    import yaml
+    manifest = yaml.safe_load((Path(__file__).parents[1]/'plugin.yaml').read_text())
+    assert 'filelock>=3.13,<4' in manifest['python_dependencies']
+
+
 def test_selection_and_reset(monkeypatch):
     state = {'one': payload(100), 'two': payload()}
     calls = []

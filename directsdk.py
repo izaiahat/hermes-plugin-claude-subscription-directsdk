@@ -443,23 +443,40 @@ class Client:
                 import account_pool
             source = self.env if self.env is not None else os.environ
             pinned = source.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR') or source.get('CLAUDE_CONFIG_DIR')
-            accounts = account_pool.configured_accounts() if self.env is None and not pinned else []
-            options = account_pool.candidates(accounts, kwargs['model'], getattr(self, '_pool_label', None)) if accounts else [None]
+            accounts = account_pool.configured_accounts()
+            if accounts and (self.env is not None or pinned):
+                raise ValueError('Claude pool is configured: remove custom env/config-directory overrides; pooled accounts must use their checked login')
+            preferred = getattr(self, '_pool_label', None)
+            options = sorted(accounts, key=lambda a: a['label'] != preferred) if accounts else [None]
+            from contextlib import nullcontext
+            reasons = []
             for account in options:
                 emitted = False
                 try:
-                    for chunk in self._run_once(request, kwargs, body, manifest, names, system, frames, account):
-                        emitted = True
-                        yield chunk
-                    if account:
-                        self._pool_label = account['label']
-                    return
+                    guard = account_pool.account_lock(account, cancelled=request.cancelled) if account else nullcontext()
+                    with guard:
+                        if request.cancelled.is_set():
+                            raise RuntimeError('Claude request cancelled')
+                        if account:
+                            try:
+                                current = account_pool.usage(account, fresh=True)
+                            except RuntimeError:
+                                reasons.append(account['label'] + ': usage unavailable; renew its CLI login')
+                                continue
+                            if not account_pool.eligible(current, kwargs['model']):
+                                reasons.append(account['label'] + ': exhausted or extra usage not disabled')
+                                continue
+                        for chunk in self._run_once(request, kwargs, body, manifest, names, system, frames, account):
+                            emitted = True
+                            yield chunk
+                        if account:
+                            self._pool_label = account['label']
+                        return
                 except account_pool.SubscriptionQuotaRejected:
                     if emitted or request.cancelled.is_set():
                         raise
-                    # The native HTTP request was definitively rejected with no output.
-                    # Try each configured account at most once; never replay accepted tools.
-            raise RuntimeError('All included Claude subscriptions exhausted; no paid fallback')
+                    # Definitive rejection, not an accepted or ambiguous tool-bearing response.
+            raise RuntimeError('All included Claude subscriptions unavailable; no paid fallback; ' + '; '.join(reasons))
         finally:
             with self._lock:
                 self._requests.discard(request)

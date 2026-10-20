@@ -24,6 +24,12 @@ collect_ignore = ["__init__.py", "directsdk.py", "directsdk_setup.py", "admissio
                   "inert_mcp.py", "evals"]
 
 
+@pytest.fixture(autouse=True)
+def no_ambient_subscription_pool(monkeypatch):
+    import account_pool
+    monkeypatch.setattr(account_pool, 'configured_accounts', lambda: [])
+
+
 @pytest.fixture
 def profile(tmp_path, monkeypatch):
     import providers

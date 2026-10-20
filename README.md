@@ -186,18 +186,26 @@ claude_subscription_accounts:
 ```
 
 Use separately authenticated official Claude Code directories; never put tokens in this list.
-The pool checks the official OAuth usage endpoint, skips exhausted/unavailable accounts, and
-requires extra usage to be explicitly OFF. A successful account stays preferred within a client.
-Reset eligibility comes from provider usage; metadata is cached for at most 30 seconds.
+The pool checks the official OAuth usage endpoint immediately before every native attempt,
+skips exhausted/unavailable accounts, and requires extra usage to be explicitly OFF.
+A successful account stays preferred within a client. A per-account process lock serializes
+pool clients across fresh admission, CLI renewal and generation; it does not control unrelated
+Claude Code processes or browser use. Usage display metadata may be cached for 30 seconds,
+but request admission and handoffs are always fresh.
 A 429 retries the next account only when fresh usage confirms exhaustion and no response was
 emitted or accepted. Cancellation, network errors and partial responses never replay.
-No API fallback, token copying, or quota-state file is introduced. Claude Code owns token refresh;
-if usage cannot be read, that account is skipped rather than treated as available.
+No API fallback or credential copying is introduced. A usage 401 triggers one official CLI
+initialize handshake with no prompt, then rechecks usage; the CLI alone owns token refresh.
+If renewal fails, the account is skipped and its separate `claude auth login --claudeai` is required.
 
 `/usage` lists each account's windows, reset times and extra-usage status.
-Explicit `CLAUDE_CONFIG_DIR` / `CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR` pins opt out of pooling.
+When a pool is configured, custom client environments and explicit directory pins are rejected
+rather than silently bypassing the checks. Remove these overrides to use the pool.
 Existing processes retain their imported plugin until a deliberate session reload.
 This pools Claude subscriptions only; the OpenAI credential pool is unchanged.
+Provider-side extra usage must remain disabled: preflight cannot prevent another client or
+operator from changing billing settings after the check. Live quota rollover and expired-token
+renewal must be distinguished from fixture coverage; no provider-enforced no-charge guarantee is claimed.
 
 ## Attribution
 

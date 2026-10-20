@@ -7,21 +7,44 @@ import directsdk
 
 ACCOUNTS = [{'label': 'one', 'config_dir': '/one'}, {'label': 'two', 'config_dir': '/two'}]
 
+@pytest.fixture(autouse=True)
+def pool_accounts(tmp_path, monkeypatch):
+    monkeypatch.setattr(pool, 'configured_accounts', lambda: [])
+    for account in ACCOUNTS:
+        directory = tmp_path/account['label']
+        directory.mkdir()
+        monkeypatch.setitem(account, 'config_dir', str(directory))
+
+
 def payload(used=0, extra=False):
     return {'five_hour': {'utilization': used}, 'seven_day': {'utilization': used}, 'extra_usage': {'is_enabled': extra}}
 
 def test_selection_and_reset(monkeypatch):
     state = {'one': payload(100), 'two': payload()}
+    calls = []
+    def once(request, kwargs, *args):
+        calls.append(args[-1]['label'])
+        yield 'complete'
+    client, request = run_wrapper(monkeypatch, once)
     monkeypatch.setattr(pool, 'usage', lambda a, **kw: state[a['label']])
-    assert pool.candidates(ACCOUNTS, 'opus') == [ACCOUNTS[1]]
+    list(client._run(request, {'model': 'opus'}, '', [], set(), '', []))
+    assert calls == ['two']
     state['one'] = payload()
-    assert pool.candidates(ACCOUNTS, 'opus')[0] == ACCOUNTS[0]
-    assert pool.candidates(ACCOUNTS, 'opus', 'two')[0] == ACCOUNTS[1]
+    client._pool_label = None
+    list(client._run(directsdk.Request(client), {'model': 'opus'}, '', [], set(), '', []))
+    assert calls == ['two', 'one']
+    client._pool_label = 'two'
+    list(client._run(directsdk.Request(client), {'model': 'opus'}, '', [], set(), '', []))
+    assert calls[-1] == 'two'
 
 def test_no_paid_or_unknown_fallback(monkeypatch):
+    def once(*args):
+        pytest.fail('no eligible account may launch native')
+        yield
+    client, request = run_wrapper(monkeypatch, once)
     monkeypatch.setattr(pool, 'usage', lambda a, **kw: payload(extra=True))
-    with pytest.raises(RuntimeError, match='No included Claude'):
-        pool.candidates(ACCOUNTS, 'opus')
+    with pytest.raises(RuntimeError, match='no paid fallback'):
+        list(client._run(request, {'model': 'opus'}, '', [], set(), '', []))
     assert not pool.eligible({}, 'opus')
 
 def run_wrapper(monkeypatch, once):
@@ -80,6 +103,70 @@ def test_reports_both_accounts(monkeypatch):
     assert [w.label for w in snapshot.windows] == ['one 5-hour', 'one weekly', 'two 5-hour', 'two weekly']
     assert all(w.used_percent == 25 for w in snapshot.windows)
     assert snapshot.details == ['one: extra usage OFF', 'two: extra usage OFF']
+
+def test_fresh_admission_on_handoff(monkeypatch):
+    calls = []
+    state = {'one': payload(), 'two': payload()}
+    def once(request, kwargs, *args):
+        calls.append(args[-1]['label'])
+        state['two'] = payload(extra=True)
+        raise pool.SubscriptionQuotaRejected('fixture quota')
+        yield
+    client, request = run_wrapper(monkeypatch, once)
+    monkeypatch.setattr(pool, 'usage', lambda a, **kw: state[a['label']])
+    with pytest.raises(RuntimeError, match='no paid fallback'):
+        list(client._run(request, {'model': 'opus'}, '', [], set(), '', []))
+    assert calls == ['one']
+
+
+def test_overrides_cannot_bypass_pool(monkeypatch):
+    def once(*args):
+        pytest.fail('override must not launch native')
+        yield
+    client, request = run_wrapper(monkeypatch, once)
+    for overrides in ({'CLAUDE_CONFIG_DIR': '/pin'}, {'OTHER': 'value'}):
+        client.env = overrides
+        with pytest.raises(ValueError, match='remove custom env'):
+            list(client._run(request, {'model': 'opus'}, '', [], set(), '', []))
+
+
+def test_official_renewal_then_preflight(monkeypatch):
+    import urllib.error
+    a = ACCOUNTS[1]
+    path = Path(a['config_dir'])/'.credentials.json'
+    path.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'fixture-expired'}}))
+    seen = []
+    def fetch(token):
+        seen.append(token)
+        if token == 'fixture-expired':
+            raise urllib.error.HTTPError('https://fixture.invalid', 401, 'fixture', {}, None)
+        return payload()
+    def renew(account):
+        assert account == a
+        path.write_text(json.dumps({'claudeAiOauth': {'accessToken': 'fixture-renewed'}}))
+    monkeypatch.setattr(pool, '_usage_request', fetch)
+    monkeypatch.setattr(pool, '_renew_login', renew)
+    assert pool.eligible(pool.usage(a, fresh=True), 'opus')
+    assert seen == ['fixture-expired', 'fixture-renewed']
+
+
+def test_account_lock_serializes_and_cancels(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    entered = threading.Event()
+    cancelled = threading.Event()
+    def wait():
+        entered.set()
+        with pool.account_lock(ACCOUNTS[0], cancelled=cancelled):
+            pytest.fail('must not pass the held lock')
+    with pool.account_lock(ACCOUNTS[0]):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(wait)
+            assert entered.wait(2)
+            cancelled.set()
+            with pytest.raises(RuntimeError, match='cancelled'):
+                future.result(timeout=2)
+
 
 def test_http_quota_rejection_retries_once(monkeypatch, tmp_path):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

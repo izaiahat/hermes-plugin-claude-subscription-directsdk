@@ -1,5 +1,8 @@
 """Select CLI-managed subscriptions; persist no credentials or quota state."""
 import json
+import os
+from contextlib import contextmanager
+from filelock import FileLock, Timeout
 from pathlib import Path
 import threading
 import time
@@ -7,6 +10,7 @@ import urllib.error
 import urllib.request
 
 _CACHE = {}
+_ACCOUNT_LOCKS = {}
 _LOCK = threading.Lock()
 
 
@@ -33,29 +37,79 @@ def configured_accounts():
     return result
 
 
+@contextmanager
+def account_lock(account, timeout=180, cancelled=None):
+    path = str(Path(account['config_dir']) / '.hermes-subscription.lock')
+    with _LOCK:
+        lock = _ACCOUNT_LOCKS.setdefault(path, FileLock(path))
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError('Claude request cancelled')
+        try:
+            lock.acquire(timeout=min(.2, max(0, deadline-time.monotonic())))
+            break
+        except Timeout:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Claude account busy: ' + account['label']) from None
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _renew_login(account):
+    """Let the official CLI refresh its own login, without submitting a prompt."""
+    try:
+        from .directsdk_setup import discover_models
+    except ImportError:
+        from directsdk_setup import discover_models
+    env = dict(os.environ)
+    for key in ('CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_SUBSCRIPTION_DIRECTSDK_CONFIG_DIR',
+                'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'):
+        env.pop(key, None)
+    env['CLAUDE_CONFIG_DIR'] = account['config_dir']
+    discover_models(env=env, timeout=20)
+
+
+def _usage_request(token):
+    request = urllib.request.Request('https://api.anthropic.com/api/oauth/usage', headers={
+        'Authorization': 'Bearer ' + token, 'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'claude-code/2.1.0', 'Accept': 'application/json'})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        return json.load(response)
+
+
 def usage(account, *, fresh=False):
-    """Read only the OAuth usage endpoint. The official CLI alone refreshes tokens."""
+    """Serialize official CLI renewal and metadata reads with other pool clients."""
     path = Path(account['config_dir']) / '.credentials.json'
     try:
-        key = (str(path), path.stat().st_mtime_ns)
-        token = json.loads(path.read_text())['claudeAiOauth']['accessToken']
-        with _LOCK:
-            cached = _CACHE.get(key)
-            if not fresh and cached and time.monotonic() - cached[0] < 30:
-                return cached[1]
-        request = urllib.request.Request('https://api.anthropic.com/api/oauth/usage', headers={
-            'Authorization': 'Bearer ' + token, 'anthropic-beta': 'oauth-2025-04-20',
-            'User-Agent': 'claude-code/2.1.0', 'Accept': 'application/json'})
-        with urllib.request.urlopen(request, timeout=8) as response:
-            payload = json.load(response)
-        if not isinstance(payload, dict):
-            raise ValueError('Invalid usage response')
-        with _LOCK:
-            _CACHE[key] = (time.monotonic(), payload)
-        return payload
+        with account_lock(account):
+            key = (str(path), path.stat().st_mtime_ns)
+            with _LOCK:
+                cached = _CACHE.get(key)
+                if not fresh and cached and time.monotonic() - cached[0] < 30:
+                    return cached[1]
+            token = json.loads(path.read_text())['claudeAiOauth']['accessToken']
+            try:
+                payload = _usage_request(token)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401:
+                    raise
+                _renew_login(account)
+                token = json.loads(path.read_text())['claudeAiOauth']['accessToken']
+                payload = _usage_request(token)
+                key = (str(path), path.stat().st_mtime_ns)
+            if not isinstance(payload, dict):
+                raise ValueError('Invalid usage response')
+            with _LOCK:
+                _CACHE[key] = (time.monotonic(), payload)
+            return payload
     except Exception as exc:
-        # Never include HTTP bodies, headers, credential contents, or exception reprs.
-        raise RuntimeError('Claude usage unavailable: ' + type(exc).__name__) from None
+        # Never expose credential contents or exception bodies. Revoked refresh needs human login.
+        raise RuntimeError('Claude usage unavailable; re-authenticate ' + account['label'] +
+                           ' with CLAUDE_CONFIG_DIR=<that directory> claude auth login --claudeai (' +
+                           type(exc).__name__ + ')') from None
 
 
 def exhausted(payload, model):
@@ -77,23 +131,6 @@ def eligible(payload, model):
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not 0 <= value <= 100:
             return False
     return not exhausted(payload, model)
-
-
-def candidates(accounts, model, preferred=None):
-    ordered = sorted(accounts, key=lambda a: a['label'] != preferred) if preferred else accounts
-    available, reasons = [], []
-    for account in ordered:
-        try:
-            payload = usage(account)
-            if eligible(payload, model):
-                available.append(account)
-            else:
-                reasons.append(account['label'] + ': exhausted or extra usage not disabled')
-        except RuntimeError:
-            reasons.append(account['label'] + ': usage unavailable')
-    if not available:
-        raise RuntimeError('No included Claude subscription available; ' + '; '.join(reasons))
-    return available
 
 
 def usage_snapshot():

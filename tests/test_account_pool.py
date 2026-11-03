@@ -19,6 +19,18 @@ def pool_accounts(tmp_path, monkeypatch):
 def payload(used=0, extra=False):
     return {'five_hour': {'utilization': used}, 'seven_day': {'utilization': used}, 'extra_usage': {'is_enabled': extra}}
 
+def test_weekly_only_quota_admission():
+    # Live usage shape: no five-hour window, valid remaining weekly quota.
+    weekly = {'five_hour': None, 'seven_day': {'utilization': 81},
+              'extra_usage': {'is_enabled': False}}
+    assert pool.eligible(weekly, 'opus')
+    assert not pool.eligible({k: v for k, v in weekly.items() if k != 'five_hour'}, 'opus')
+    assert not pool.eligible({**weekly, 'five_hour': {}}, 'opus')
+    assert not pool.eligible({**weekly, 'seven_day': None}, 'opus')
+    assert not pool.eligible({**weekly, 'seven_day': {'utilization': 100}}, 'opus')
+    assert not pool.eligible({**weekly, 'extra_usage': {'is_enabled': True}}, 'opus')
+
+
 def test_filelock_dependency_declared():
     manifest = (Path(__file__).parents[1]/'plugin.yaml').read_text()
     assert 'filelock>=3.13,<4' in manifest.split('python_dependencies:')[1].split('platforms:')[0]

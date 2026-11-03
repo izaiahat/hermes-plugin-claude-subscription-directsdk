@@ -127,6 +127,10 @@ def eligible(payload, model):
     if (payload.get('extra_usage') or {}).get('is_enabled') is not False:
         return False
     for key in ('five_hour', 'seven_day'):
+        # The usage API explicitly returns null when this window does not apply.
+        # Still require a valid weekly quota; missing keys are not clearance.
+        if key == 'five_hour' and key in payload and payload[key] is None:
+            continue
         value = (payload.get(key) or {}).get('utilization')
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not 0 <= value <= 100:
             return False
